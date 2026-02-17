@@ -12,25 +12,19 @@ import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
 
-
 # =========================
 # Page config
 # =========================
 st.set_page_config(page_title="Spotify Israel – 7.10 Impact", layout="wide")
 
-# Base dir = folder of this file (works reliably on Git remote)
+# Always resolve paths relative to THIS file (works on Git remote)
 BASE_DIR = Path(__file__).resolve().parent
 
 
 # =========================
-# Helpers: robust path resolving
+# Path utils
 # =========================
 def resolve_repo_path(p: str) -> str:
-    """
-    Resolve a path that is stored in META (relative to repo root / script dir).
-    If p is absolute -> return as-is.
-    If p is relative -> resolve relative to BASE_DIR.
-    """
     p = (p or "").strip()
     if not p:
         return ""
@@ -40,9 +34,52 @@ def resolve_repo_path(p: str) -> str:
     return str((BASE_DIR / pp).resolve())
 
 
+def norm_key(s: str) -> str:
+    """Normalize artist name / filename stem to a comparable key."""
+    s = (s or "").strip().lower()
+    s = s.replace("&", "and")
+    s = re.sub(r"\bfeat\.?\b|\bft\.?\b", " ", s)
+    s = re.sub(r"[^0-9a-z\u0590-\u05ff]+", "", s)  # keep Hebrew too
+    return s
+
+
+@st.cache_data
+def build_avatar_lookup(rel_dir: str = "artists_photos") -> dict:
+    """
+    Build lookup: normalized_key -> absolute image path
+    from files inside rel_dir (relative to repo).
+    Supports jpg/jpeg/png/webp.
+    """
+    folder = Path(resolve_repo_path(rel_dir))
+    exts = {".jpg", ".jpeg", ".png", ".webp"}
+    lookup = {}
+    if folder.exists() and folder.is_dir():
+        for p in folder.iterdir():
+            if p.is_file() and p.suffix.lower() in exts:
+                lookup[norm_key(p.stem)] = str(p.resolve())
+                lookup[norm_key(p.name)] = str(p.resolve())
+    return lookup
+
+
 # =========================
 # Helpers: column detection
 # =========================
+CANONICAL_ARTIST = {
+    # Ness & Stilla variants
+    "ness": "Ness & Stilla",
+    "stilla": "Ness & Stilla",
+    "nessandstilla": "Ness & Stilla",
+    "nessstilla": "Ness & Stilla",
+
+    # The Weeknd typo you've got in filenames sometimes
+    "theweekend": "The Weeknd",   # keep if your dataset has this typo
+    "theweeknd": "The Weeknd",
+}
+
+def canon_artist(name: str) -> str:
+    k = norm_key(name)
+    return CANONICAL_ARTIST.get(k, name.strip() if isinstance(name, str) else name)
+
 def _find_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
     cols_lower = {c.lower(): c for c in df.columns}
     for cand in candidates:
@@ -71,7 +108,7 @@ def _detect_hebrew(text_series: pd.Series) -> pd.Series:
 
 
 # =========================
-# Cache controls
+# Cache control
 # =========================
 st.sidebar.title("Filters")
 if st.sidebar.button("Clear cache"):
@@ -123,7 +160,6 @@ def load_main_csv(path: str) -> pd.DataFrame:
     else:
         df["is_hebrew_track"] = np.nan
 
-    # Primary artist for join (split on comma / '&' / feat etc.)
     if "artist_names" in df.columns:
         primary = (
             df["artist_names"]
@@ -141,9 +177,9 @@ def load_main_csv(path: str) -> pd.DataFrame:
 
 @st.cache_data
 def load_artist_meta_groups(path: str) -> pd.DataFrame:
-    """Small meta for the sidebar 'Artist Group' filter."""
     if not os.path.exists(path):
         raise FileNotFoundError(f"Missing file: {path}")
+
     meta = pd.read_excel(path, engine="openpyxl")
 
     col_artist = _find_col(meta, ["artist", "artist_name", "name", "names_artist"])
@@ -181,9 +217,8 @@ def load_artist_meta_groups(path: str) -> pd.DataFrame:
 def load_artist_meta_full(path: str) -> pd.DataFrame:
     """
     Full meta for dumbbell:
-    - index by artist
-    - image_path resolved later
-    - pro_israel / anti_israel / neutral
+    - index by normalized artist_key for robust joining
+    - image_path_abs is computed and used if valid
     """
     if not os.path.exists(path):
         raise FileNotFoundError(f"Missing file: {path}")
@@ -200,34 +235,31 @@ def load_artist_meta_full(path: str) -> pd.DataFrame:
     for c in ["anti_israel", "pro_israel", "neutral"]:
         meta[c] = pd.to_numeric(meta[c], errors="coerce").fillna(0).astype(int)
 
-    # IMPORTANT: resolve image paths relative to streamlit_app.py location
+    meta["artist_key"] = meta["artist"].apply(norm_key)
     meta["image_path_abs"] = meta["image_path"].apply(resolve_repo_path)
 
-    return meta.drop_duplicates("artist").set_index("artist")
+    meta = meta.drop_duplicates("artist_key").set_index("artist_key")
+    return meta
 
 
 def safe_load():
-    # resolve paths robustly
     main_path = resolve_repo_path("data/merged_all_weeks.csv")
-    # NOTE: use the UPDATED meta you uploaded into repo
+    # make sure your repo contains this file name exactly:
     meta_path = resolve_repo_path("/workspaces/gdp-dashboard/artist_meta_filled_UPDATED.xlsx")
 
-    # load main
     try:
         df_main = load_main_csv(main_path)
     except Exception as e:
         st.error(f"Failed to load main CSV: {e}")
-        st.info("Expected: data/merged_all_weeks.csv (relative to repo).")
+        st.info("Expected: data/merged_all_weeks.csv")
         st.stop()
 
-    # load groups meta (for filter) - if fails, continue
     try:
         df_meta_groups = load_artist_meta_groups(meta_path)
     except Exception as e:
-        st.warning(f"Artist meta not loaded for groups ({e}). Continuing with artist_group='Unknown'.")
+        st.warning(f"Artist meta XLSX not loaded for group filter ({e}). Using Unknown.")
         df_meta_groups = pd.DataFrame(columns=["artist", "artist_group"])
 
-    # merge on primary_artist (only for the group filter)
     if "primary_artist" in df_main.columns and "artist" in df_meta_groups.columns:
         merged = df_main.merge(df_meta_groups, left_on="primary_artist", right_on="artist", how="left")
         merged.drop(columns=["artist"], inplace=True, errors="ignore")
@@ -237,16 +269,16 @@ def safe_load():
     if "artist_group" not in merged.columns:
         merged["artist_group"] = "Unknown"
     merged["artist_group"] = merged["artist_group"].fillna("Unknown")
+
     return merged, meta_path
 
 
-df, META_PATH_RESOLVED = safe_load()
+df, META_PATH = safe_load()
 
 
 # =========================
 # Sidebar filters
 # =========================
-# Date range
 if df["week"].notna().any():
     min_date = df["week"].min().date()
     max_date = df["week"].max().date()
@@ -258,13 +290,11 @@ else:
     dff = df.copy()
     st.sidebar.warning("No valid 'week' dates detected in CSV.")
 
-# Period filter
 periods = [p for p in ["Before 7.10", "After 7.10"] if p in dff["period"].unique()]
 if periods:
     period_sel = st.sidebar.multiselect("Period", options=sorted(dff["period"].unique()), default=periods)
     dff = dff[dff["period"].isin(period_sel)]
 
-# Hebrew filter
 if "is_hebrew_track" in dff.columns and dff["is_hebrew_track"].notna().any():
     heb_opt = st.sidebar.selectbox("Hebrew track?", ["All", "Hebrew", "Non-Hebrew"])
     if heb_opt == "Hebrew":
@@ -272,12 +302,10 @@ if "is_hebrew_track" in dff.columns and dff["is_hebrew_track"].notna().any():
     elif heb_opt == "Non-Hebrew":
         dff = dff[dff["is_hebrew_track"] == 0]
 
-# Rank filter
 if "rank" in dff.columns and dff["rank"].notna().any():
     top_n = st.sidebar.slider("Top N (by rank)", 50, 200, 200, step=10)
     dff = dff[dff["rank"] <= top_n]
 
-# Artist group filter
 if "artist_group" in dff.columns:
     groups = sorted(dff["artist_group"].fillna("Unknown").unique().tolist())
     group_sel = st.sidebar.multiselect("Artist Group", options=groups, default=groups)
@@ -432,41 +460,42 @@ with tabs[3]:
         if g == "neutral": return RING_ORANGE
         return RING_GRAY
 
-    def group_of_artist(meta_full: pd.DataFrame, a: str) -> str:
-        if a not in meta_full.index:
-            return "unknown"
-        if int(meta_full.loc[a, "pro_israel"]) == 1: return "pro"
-        if int(meta_full.loc[a, "anti_israel"]) == 1: return "anti"
-        if int(meta_full.loc[a, "neutral"]) == 1: return "neutral"
-        return "unknown"
+    # load meta (keyed by normalized name)
+    try:
+        meta_full = load_artist_meta_full(META_PATH)
+    except Exception as e:
+        st.error(f"Failed to load META: {e}")
+        st.stop()
 
-    def split_artists(s):
-        if pd.isna(s):
-            return []
-        return [p.strip() for p in str(s).split(",") if p.strip()]
+    # build folder lookup for images (fallback)
+    avatar_lookup = build_avatar_lookup("artists_photos")
+
+    def group_of_artist(artist_name: str) -> str:
+        k = norm_key(artist_name)
+        if k not in meta_full.index:
+            return "unknown"
+        if int(meta_full.loc[k, "pro_israel"]) == 1: return "pro"
+        if int(meta_full.loc[k, "anti_israel"]) == 1: return "anti"
+        if int(meta_full.loc[k, "neutral"]) == 1: return "neutral"
+        return "unknown"
 
     def bytes_to_data_uri_png(png_bytes: bytes) -> str:
         return "data:image/png;base64," + base64.b64encode(png_bytes).decode("utf-8")
 
-    def pil_circle_avatar(image_path_abs: str, size_px: int = 120):
-        """
-        image_path_abs must be absolute path (we precompute it).
-        Returns PNG bytes or None.
-        """
-        if not image_path_abs or not os.path.exists(image_path_abs):
+    def pil_circle_avatar(image_abs: str, size_px: int = 120):
+        """Return circular avatar PNG bytes or None."""
+        if not image_abs or not os.path.exists(image_abs):
             return None
         try:
             from PIL import Image, ImageOps, ImageDraw
-            im = Image.open(image_path_abs)  # keep format support
-            im = ImageOps.exif_transpose(im)
-            im = im.convert("RGBA")
+            im = Image.open(image_abs)
+            im = ImageOps.exif_transpose(im).convert("RGBA")
 
             w, h = im.size
             m = min(w, h)
             left = (w - m) // 2
             top = (h - m) // 2
-            im = im.crop((left, top, left + m, top + m))
-            im = im.resize((size_px, size_px), Image.LANCZOS)
+            im = im.crop((left, top, left + m, top + m)).resize((size_px, size_px), Image.LANCZOS)
 
             mask = Image.new("L", (size_px, size_px), 0)
             draw = ImageDraw.Draw(mask)
@@ -476,42 +505,51 @@ with tabs[3]:
             out.paste(im, (0, 0), mask=mask)
 
             buf = io.BytesIO()
-            out.save(buf, format="PNG")  # always output PNG bytes for Plotly
+            out.save(buf, format="PNG")
             return buf.getvalue()
         except Exception:
             return None
 
-    # Load full meta (absolute image paths computed inside)
-    try:
-        meta_full = load_artist_meta_full(META_PATH_RESOLVED)
-    except Exception as e:
-        st.error(f"Failed to load META: {e}")
-        st.stop()
-
-    # Debug summary: how many image paths exist
-    with st.expander("Debug: META + image paths"):
-        st.write("META path:", META_PATH_RESOLVED)
-        if "image_path_abs" in meta_full.columns:
-            exists = meta_full["image_path_abs"].apply(lambda p: Path(p).exists())
-            st.write("Images found on server:", int(exists.sum()), "/", len(exists))
-            st.dataframe(
-                meta_full.reset_index()[["artist", "image_path", "image_path_abs"]].assign(img_exists=exists.values)
-                .loc[lambda d: ~d["img_exists"]]
-                .head(30),
-                use_container_width=True
-            )
+    # Debug: show image existence (top few missing)
+    with st.expander("Debug: META + image matching"):
+        st.write("META path:", META_PATH)
+        st.write("Images folder:", resolve_repo_path("artists_photos"))
+        # count existing via meta_path_abs OR folder lookup
+        exists_count = 0
+        sample_missing = []
+        for k in meta_full.index[:200]:  # limit
+            cand = str(meta_full.loc[k, "image_path_abs"])
+            ok = cand and Path(cand).exists()
+            if not ok:
+                cand2 = avatar_lookup.get(k, "")
+                ok = cand2 and Path(cand2).exists()
+            if ok:
+                exists_count += 1
+            else:
+                sample_missing.append((meta_full.loc[k].get("image_path_abs", ""), k))
+        st.write("Meta rows:", len(meta_full), " | images found for meta keys:", exists_count)
+        if sample_missing:
+            st.write("Example missing (first 10):")
+            st.write(sample_missing[:10])
 
     if "artist_names" not in dff.columns or "streams" not in dff.columns or not dff["week"].notna().any():
         st.warning("Need valid week/streams/artist_names to build the dumbbell chart.")
         st.stop()
 
     # Build weekly artist streams (split collabs evenly)
+    def split_artists(s):
+        if pd.isna(s):
+            return []
+        return [p.strip() for p in str(s).split(",") if p.strip()]
+
     base_df = dff[["week", "artist_names", "streams"]].copy()
     base_df["artist_list"] = base_df["artist_names"].apply(split_artists)
     base_df = base_df[base_df["artist_list"].map(len) > 0].copy()
     base_df["n_artists"] = base_df["artist_list"].map(len)
     base_df = base_df.explode("artist_list", ignore_index=True).rename(columns={"artist_list": "artist"})
     base_df["artist"] = base_df["artist"].astype(str).str.strip()
+    base_df["artist"] = base_df["artist"].apply(canon_artist)   # <-- מאחד Ness/Stilla
+
     base_df["artist_streams"] = base_df["streams"] / base_df["n_artists"]
 
     weekly = (
@@ -558,7 +596,7 @@ with tabs[3]:
         st.warning("No artists have both Before and After data with a valid baseline.")
         st.stop()
 
-    summary["group"] = summary["artist"].apply(lambda a: group_of_artist(meta_full, a))
+    summary["group"] = summary["artist"].apply(group_of_artist)
     summary["color"] = summary["group"].apply(ring_color)
     summary["delta"] = summary["After"] - summary["Before"]
     summary["importance"] = summary["Before"] + summary["After"]
@@ -600,9 +638,9 @@ with tabs[3]:
     ))
 
     # Avatars
-    missing_avatars = 0
+    missing_files = 0
     failed_open = 0
-    if show_avatars and "image_path_abs" in meta_full.columns:
+    if show_avatars:
         x_min = float(np.nanmin(summary[["Before", "After"]].values))
         x_max = float(np.nanmax(summary[["Before", "After"]].values))
         x_range = max(1.0, x_max - x_min)
@@ -611,13 +649,21 @@ with tabs[3]:
 
         for _, r in summary.iterrows():
             a = r["artist"]
-            if a not in meta_full.index:
-                missing_avatars += 1
-                continue
+            k = norm_key(a)
 
-            img_abs = str(meta_full.loc[a, "image_path_abs"])
+            # priority 1: meta image_path_abs if exists
+            img_abs = ""
+            if k in meta_full.index:
+                cand = str(meta_full.loc[k, "image_path_abs"])
+                if cand and Path(cand).exists():
+                    img_abs = cand
+
+            # priority 2: folder lookup
+            if not img_abs:
+                img_abs = avatar_lookup.get(k, "")
+
             if not img_abs or not Path(img_abs).exists():
-                missing_avatars += 1
+                missing_files += 1
                 continue
 
             avatar_bytes = pil_circle_avatar(img_abs, size_px=120)
@@ -649,7 +695,6 @@ with tabs[3]:
         zeroline=False
     )
 
-    # Legend
     fig.add_trace(go.Scatter(
         x=[None], y=[None], mode="lines+markers",
         line=dict(width=4, color=RING_GREEN),
@@ -694,18 +739,15 @@ with tabs[3]:
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Artists shown", f"{len(summary)}")
     m2.metric("Median Δ (After−Before)", f"{summary['delta'].median():.1f}")
-    m3.metric("Missing image files", f"{missing_avatars}" if show_avatars else "—")
+    m3.metric("Missing image files", f"{missing_files}" if show_avatars else "—")
     m4.metric("Failed to open images", f"{failed_open}" if show_avatars else "—")
 
-    if show_avatars and failed_open > 0:
-        st.warning(
-            "Some images exist but could not be opened. "
-            "If the failing ones are .webp, your server Pillow build may not support WEBP. "
-            "Best fix: convert WEBP to JPG/PNG in the repo and update META paths."
-        )
-
     with st.expander("Show summary table"):
+        view = summary.copy()
+        view["Before"] = view["Before"].round(1)
+        view["After"] = view["After"].round(1)
+        view["delta"] = view["delta"].round(1)
         st.dataframe(
-            summary[["artist", "Before", "After", "delta", "group"]].sort_values("delta", ascending=False),
+            view[["artist", "group", "Before", "After", "delta"]].sort_values("delta", ascending=False),
             use_container_width=True
         )
