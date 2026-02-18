@@ -12,12 +12,33 @@ import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
 
+from sklearn.preprocessing import StandardScaler
+from sklearn.cluster import KMeans
+from sklearn.metrics import silhouette_score, calinski_harabasz_score, davies_bouldin_score
+
 # =========================
 # Page config
 # =========================
 st.set_page_config(page_title="Spotify Israel – 7.10 Impact", layout="wide")
+# =========================
+# Key dates & events
+# =========================
+CUTOFF_DATE = pd.Timestamp("2023-10-07")
 
-# Always resolve paths relative to THIS file (works on Git remote)
+EVENTS = {
+    "Protests after the reasonableness standard repeal": "2023-07-30",
+    "Rosh Hashanah": "2023-09-17",
+    "Evacuation of communities in the North & South": "2023-10-15",
+    "First hostage deal": "2023-11-24",
+    "Hanukkah": "2023-12-10",
+    "Shooting of 6 hostages": "2023-12-15",
+    "Building collapse killing 21 soldiers": "2024-01-21",
+    "Rescue operation of 2 hostages": "2024-02-12",
+    "Hostage deal talks": "2024-03-11",
+    "Escalation in the North": "2024-03-23",
+}
+
+
 BASE_DIR = Path(__file__).resolve().parent
 
 
@@ -35,21 +56,15 @@ def resolve_repo_path(p: str) -> str:
 
 
 def norm_key(s: str) -> str:
-    """Normalize artist name / filename stem to a comparable key."""
     s = (s or "").strip().lower()
     s = s.replace("&", "and")
     s = re.sub(r"\bfeat\.?\b|\bft\.?\b", " ", s)
-    s = re.sub(r"[^0-9a-z\u0590-\u05ff]+", "", s)  # keep Hebrew too
+    s = re.sub(r"[^0-9a-z\u0590-\u05ff]+", "", s)
     return s
 
 
 @st.cache_data
 def build_avatar_lookup(rel_dir: str = "artists_photos") -> dict:
-    """
-    Build lookup: normalized_key -> absolute image path
-    from files inside rel_dir (relative to repo).
-    Supports jpg/jpeg/png/webp.
-    """
     folder = Path(resolve_repo_path(rel_dir))
     exts = {".jpg", ".jpeg", ".png", ".webp"}
     lookup = {}
@@ -65,14 +80,11 @@ def build_avatar_lookup(rel_dir: str = "artists_photos") -> dict:
 # Helpers: column detection
 # =========================
 CANONICAL_ARTIST = {
-    # Ness & Stilla variants
     "ness": "Ness & Stilla",
     "stilla": "Ness & Stilla",
     "nessandstilla": "Ness & Stilla",
     "nessstilla": "Ness & Stilla",
-
-    # The Weeknd typo you've got in filenames sometimes
-    "theweekend": "The Weeknd",   # keep if your dataset has this typo
+    "theweekend": "The Weeknd",
     "theweeknd": "The Weeknd",
 }
 
@@ -106,6 +118,44 @@ def _detect_hebrew(text_series: pd.Series) -> pd.Series:
     heb_re = re.compile(r"[\u0590-\u05FF]")
     return text_series.astype(str).apply(lambda x: bool(heb_re.search(x)))
 
+def add_event_lines(fig, selected_event_labels, *, show_labels=False, y_for_label=None):
+    # Event lines (light)
+    for label in selected_event_labels:
+        dt = pd.to_datetime(EVENTS.get(label), errors="coerce")
+        if pd.isna(dt):
+            continue
+
+        fig.add_vline(
+            x=dt,
+            line_dash="dot",
+            line_color="rgba(0,0,0,0.35)",
+            line_width=1
+        )
+
+        if show_labels and (y_for_label is not None):
+            fig.add_annotation(
+                x=dt,
+                y=y_for_label,
+                text=label,
+                showarrow=True,
+                arrowhead=2,
+                ax=18,
+                ay=-22,
+                font=dict(size=11),
+                bgcolor="rgba(255,255,255,0.75)",
+                bordercolor="rgba(0,0,0,0.15)",
+                borderwidth=1,
+            )
+
+    # 7.10 line (strong) — ALWAYS visible on these charts
+    fig.add_vline(
+        x=CUTOFF_DATE,
+        line_dash="dash",
+        line_color="rgba(0,0,0,0.95)",
+        line_width=3
+    )
+    return fig
+
 
 # =========================
 # Cache control
@@ -131,6 +181,7 @@ def load_main_csv(path: str) -> pd.DataFrame:
     col_rank = _find_col(df, ["rank", "position"])
     col_track = _find_col(df, ["track_name", "name_track", "track", "song", "title"])
     col_artist = _find_col(df, ["artist_names", "names_artist", "artist", "artists"])
+    col_uri = _find_col(df, ["uri", "track_uri", "spotify_uri", "track_id", "id"])
 
     if col_week:
         df[col_week] = _coerce_week(df[col_week])
@@ -146,6 +197,8 @@ def load_main_csv(path: str) -> pd.DataFrame:
         df.rename(columns={col_track: "track_name"}, inplace=True)
     if col_artist:
         df.rename(columns={col_artist: "artist_names"}, inplace=True)
+    if col_uri:
+        df.rename(columns={col_uri: "uri"}, inplace=True)
 
     if "week" in df.columns and df["week"].notna().any():
         df["period"] = _make_period(df["week"])
@@ -215,11 +268,6 @@ def load_artist_meta_groups(path: str) -> pd.DataFrame:
 
 @st.cache_data
 def load_artist_meta_full(path: str) -> pd.DataFrame:
-    """
-    Full meta for dumbbell:
-    - index by normalized artist_key for robust joining
-    - image_path_abs is computed and used if valid
-    """
     if not os.path.exists(path):
         raise FileNotFoundError(f"Missing file: {path}")
 
@@ -242,9 +290,262 @@ def load_artist_meta_full(path: str) -> pd.DataFrame:
     return meta
 
 
+# =========================
+# Genres pipeline (KMeans + Rules)  ✅ NEW
+# =========================
+FEATS = [
+    "danceability","energy","valence","tempo","loudness",
+    "acousticness","instrumentalness","speechiness","liveness"
+]
+
+HEB_RE = re.compile(r"[\u0590-\u05FF]")
+
+def _has_hebrew(x) -> bool:
+    return bool(HEB_RE.search(str(x))) if pd.notna(x) else False
+
+def _wavg(g: pd.DataFrame, col: str, w: str = "streams") -> float:
+    ww = g[w].fillna(0).to_numpy()
+    xx = g[col].to_numpy()
+    s = ww.sum()
+    return float((xx * ww).sum() / s) if s > 0 else float(np.mean(xx))
+
+def _name_cluster(row: pd.Series) -> str:
+    e = row["energy"]
+    dnc = row["danceability"]
+    ac = row["acousticness"]
+    inst = row["instrumentalness"]
+    sp = row["speechiness"]
+    val = row["valence"]
+    tmp = row["tempo"]
+    loud = row["loudness"]
+
+    if ac > 0.55 and e < 0.45 and inst < 0.35:
+        return "Classic / Acoustic"
+    if inst > 0.55 and sp < 0.08:
+        return "Instrumental / Ambient"
+    if sp > 0.20 and e > 0.50:
+        return "Rap / Hip-Hop"
+    if e > 0.70 and loud > -7 and dnc < 0.55:
+        return "Rock"
+    if dnc > 0.72 and e > 0.65 and tmp > 115:
+        return "Pop / EDM"
+    if val < 0.40 and e < 0.55 and ac > 0.35:
+        return "Ballad / Sad Pop"
+    return "Pop"
+
+@st.cache_data
+def add_genres(df_in: pd.DataFrame, k: int = 8, random_state: int = 42):
+    """
+    Returns (dfg, report_dict)
+    - dfg: original df with added columns: cluster, genre_base, genre
+    - report_dict: metrics + tables for debug
+    """
+    d = df_in.copy()
+
+    need_cols = ["uri", "track_name", "artist_names", "week"] + FEATS
+    missing = [c for c in need_cols if c not in d.columns]
+    if missing:
+        return d, {"ok": False, "reason": f"Missing columns: {missing}"}
+
+    d["week"] = pd.to_datetime(d["week"], dayfirst=True, errors="coerce")
+
+    if "streams" not in d.columns:
+        d["streams"] = np.nan
+
+    for c in FEATS + ["streams"]:
+        d[c] = pd.to_numeric(d[c], errors="coerce")
+
+    track = d.dropna(subset=["uri"] + FEATS).copy()
+    if track.empty:
+        return d, {"ok": False, "reason": "No rows with uri + audio features."}
+
+    track_song = (
+        track.groupby("uri")
+             .apply(lambda g: pd.Series({
+                 "track_name": g["track_name"].iloc[0],
+                 "artist_names": g["artist_names"].iloc[0],
+                 **{f: _wavg(g, f) for f in FEATS}
+             }))
+             .reset_index()
+    )
+
+    X = track_song[FEATS].to_numpy()
+    scaler = StandardScaler()
+    Xz = scaler.fit_transform(X)
+
+    kmeans = KMeans(n_clusters=int(k), random_state=int(random_state), n_init="auto")
+    track_song["cluster"] = kmeans.fit_predict(Xz)
+
+    centroids = pd.DataFrame(
+        scaler.inverse_transform(kmeans.cluster_centers_),
+        columns=FEATS
+    )
+    centroids["cluster"] = range(int(k))
+    cluster2name = centroids.set_index("cluster").apply(_name_cluster, axis=1).to_dict()
+
+    def _tag_from_centroid(row: pd.Series, base_name: str) -> str:
+        """
+        Create a semantic tag to disambiguate clusters with the same base_name.
+        Uses centroid features to produce labels like:
+        High Energy / Acoustic / Instrumental / Rap / Rock / Upbeat / Chill / Fast Tempo / etc.
+        """
+        e = float(row.get("energy", np.nan))
+        dnc = float(row.get("danceability", np.nan))
+        ac = float(row.get("acousticness", np.nan))
+        inst = float(row.get("instrumentalness", np.nan))
+        sp = float(row.get("speechiness", np.nan))
+        val = float(row.get("valence", np.nan))
+        tmp = float(row.get("tempo", np.nan))
+        loud = float(row.get("loudness", np.nan))
+
+        tags = []
+
+        # strong “identity” tags first
+        if sp >= 0.22:
+            tags.append("Rap")
+        if inst >= 0.55:
+            tags.append("Instrumental")
+        if ac >= 0.60:
+            tags.append("Acoustic")
+        if e >= 0.75:
+            tags.append("High Energy")
+        if e <= 0.40:
+            tags.append("Chill")
+
+        # musical feel
+        if val >= 0.65:
+            tags.append("Upbeat")
+        elif val <= 0.35:
+            tags.append("Sad")
+
+        # dance / tempo / loudness
+        if dnc >= 0.72:
+            tags.append("Dance")
+        if tmp >= 125:
+            tags.append("Fast Tempo")
+        elif tmp <= 95:
+            tags.append("Slow Tempo")
+
+        if loud >= -6.5:
+            tags.append("Loud")
+
+        # Rock-ish hint (if base is Rock we don't need it, but can reinforce)
+        if base_name == "Rock":
+            if e >= 0.70 and loud >= -7:
+                tags.insert(0, "Rock")
+
+        # Keep it short + stable
+        # return the first tag that exists; if none, return a generic fallback.
+        return tags[0] if tags else "Style"
+
+    # --- semantic unique naming ---
+    # map: base_name -> list of clusters that share this name
+    base2clusters = {}
+    for c in range(int(k)):
+        base = str(cluster2name.get(c, "Other")).strip() or "Other"
+        base2clusters.setdefault(base, []).append(c)
+
+    cluster2unique = {}
+
+    for base_name, clusters in base2clusters.items():
+        if len(clusters) == 1:
+            cluster2unique[clusters[0]] = base_name
+            continue
+
+        # build tags per cluster using centroids
+        used = set()
+        for c in clusters:
+            row = centroids.loc[centroids["cluster"] == c].iloc[0]
+            tag = _tag_from_centroid(row, base_name)
+
+            # ensure tag uniqueness inside same base_name group
+            if tag in used:
+                # try next-best tags by generating a short ordered list
+                # (same logic as _tag_from_centroid, but we’ll grab multiple)
+                e = float(row.get("energy", np.nan))
+                dnc = float(row.get("danceability", np.nan))
+                ac = float(row.get("acousticness", np.nan))
+                inst = float(row.get("instrumentalness", np.nan))
+                sp = float(row.get("speechiness", np.nan))
+                val = float(row.get("valence", np.nan))
+                tmp = float(row.get("tempo", np.nan))
+                loud = float(row.get("loudness", np.nan))
+
+                candidates = []
+                if sp >= 0.22: candidates.append("Rap")
+                if inst >= 0.55: candidates.append("Instrumental")
+                if ac >= 0.60: candidates.append("Acoustic")
+                if e >= 0.75: candidates.append("High Energy")
+                if e <= 0.40: candidates.append("Chill")
+                if val >= 0.65: candidates.append("Upbeat")
+                if val <= 0.35: candidates.append("Sad")
+                if dnc >= 0.72: candidates.append("Dance")
+                if tmp >= 125: candidates.append("Fast Tempo")
+                if tmp <= 95: candidates.append("Slow Tempo")
+                if loud >= -6.5: candidates.append("Loud")
+                candidates = candidates or ["Style"]
+
+                # pick first unused, else fallback with index
+                picked = None
+                for cand in candidates:
+                    if cand not in used:
+                        picked = cand
+                        break
+                if picked is None:
+                    picked = f"Variant {len(used)+1}"
+                tag = picked
+
+            used.add(tag)
+            cluster2unique[c] = f"{base_name} ({tag})"
+
+    track_song["genre_base"] = track_song["cluster"].map(cluster2name)
+
+    # ✅ genre label: ONLY the semantic genre name (no "Cluster 0")
+    track_song["genre"] = track_song["cluster"].astype(int).map(cluster2unique)
+    # ✅ must exist before using it
+
+    track_song["is_hebrew"] = (
+        track_song["track_name"].apply(_has_hebrew) |
+        track_song["artist_names"].apply(_has_hebrew)
+    )
+
+
+    # Optional tag (does NOT change genre count)
+    mask_mizrahi = (
+        track_song["is_hebrew"] &
+        (track_song["danceability"] > 0.62) &
+        (track_song["energy"] > 0.55)
+    )
+    track_song["is_mizrahi"] = mask_mizrahi.astype(int)
+
+
+    dfg = d.merge(track_song[["uri", "cluster", "genre_base", "genre", "is_mizrahi"]], on="uri", how="left")
+
+    report = {"ok": True, "k": int(k), "inertia": float(kmeans.inertia_), "n_iter": int(kmeans.n_iter_)}
+    try:
+        report["silhouette"] = float(silhouette_score(Xz, track_song["cluster"]))
+        report["calinski_harabasz"] = float(calinski_harabasz_score(Xz, track_song["cluster"]))
+        report["davies_bouldin"] = float(davies_bouldin_score(Xz, track_song["cluster"]))
+    except Exception as e:
+        report["metrics_note"] = f"Metrics skipped: {e}"
+
+    cluster_sizes = track_song["cluster"].value_counts().sort_index().rename("n_songs").reset_index()
+    cluster_sizes = cluster_sizes.rename(columns={"index": "cluster"})
+    centroids_out = centroids.copy()
+    centroids_out["genre_base"] = centroids_out["cluster"].map(cluster2name)
+    centroids_out = centroids_out.merge(cluster_sizes, on="cluster", how="left")
+
+    report["cluster_sizes"] = cluster_sizes
+    report["centroids"] = centroids_out.sort_values("n_songs", ascending=False)
+
+    return dfg, report
+
+
+# =========================
+# safe_load
+# =========================
 def safe_load():
     main_path = resolve_repo_path("data/merged_all_weeks.csv")
-    # make sure your repo contains this file name exactly:
     meta_path = resolve_repo_path("/workspaces/gdp-dashboard/artist_meta_filled_UPDATED.xlsx")
 
     try:
@@ -269,6 +570,7 @@ def safe_load():
     if "artist_group" not in merged.columns:
         merged["artist_group"] = "Unknown"
     merged["artist_group"] = merged["artist_group"].fillna("Unknown")
+
 
     return merged, meta_path
 
@@ -295,13 +597,6 @@ if periods:
     period_sel = st.sidebar.multiselect("Period", options=sorted(dff["period"].unique()), default=periods)
     dff = dff[dff["period"].isin(period_sel)]
 
-if "is_hebrew_track" in dff.columns and dff["is_hebrew_track"].notna().any():
-    heb_opt = st.sidebar.selectbox("Hebrew track?", ["All", "Hebrew", "Non-Hebrew"])
-    if heb_opt == "Hebrew":
-        dff = dff[dff["is_hebrew_track"] == 1]
-    elif heb_opt == "Non-Hebrew":
-        dff = dff[dff["is_hebrew_track"] == 0]
-
 if "rank" in dff.columns and dff["rank"].notna().any():
     top_n = st.sidebar.slider("Top N (by rank)", 50, 200, 200, step=10)
     dff = dff[dff["rank"] <= top_n]
@@ -319,12 +614,29 @@ st.title("Spotify Israel – Listening Patterns Around 7.10")
 st.caption("Dashboard built from merged_all_weeks.csv + artist_meta_filled_UPDATED.xlsx")
 
 k1, k2, k3, k4 = st.columns(4)
-
 k1.metric("Total Streams", f"{int(dff['streams'].sum()):,}" if "streams" in dff.columns and dff["streams"].notna().any() else "N/A")
 k2.metric("Unique Tracks", f"{dff['track_name'].nunique():,}" if "track_name" in dff.columns else "N/A")
 k3.metric("Unique Artists", f"{dff['primary_artist'].nunique():,}" if "primary_artist" in dff.columns else "N/A")
 k4.metric("Weeks Covered", f"{dff['week'].dt.to_period('W').nunique():,}" if dff["week"].notna().any() else "N/A")
 
+st.sidebar.divider()
+st.sidebar.subheader("Event lines")
+
+show_events = st.sidebar.checkbox("Show event lines", value=False)
+
+event_labels = list(EVENTS.keys())
+default_events = [
+    "Evacuation of communities in the North & South",
+    "First hostage deal",
+    "Building collapse killing 21 soldiers",
+]
+
+selected_events = st.sidebar.multiselect(
+    "Choose events",
+    options=event_labels,
+    default=default_events if show_events else []
+)
+show_event_labels = st.sidebar.checkbox("Show event labels on chart", value=False)
 
 # =========================
 # Tabs
@@ -332,104 +644,280 @@ k4.metric("Weeks Covered", f"{dff['week'].dt.to_period('W').nunique():,}" if dff
 tabs = st.tabs([
     "Overview",
     "Audio Features Over Time",
-    "Hebrew vs Non-Hebrew",
+    "Genres (Before vs After)",
     "Before vs After (Dumbbell + Avatars)",
 ])
 
 cutoff_date = pd.Timestamp("2023-10-07")
+EVENTS = {
+    "Protests after the reasonableness standard repeal": "2023-07-30",
+    "Rosh Hashanah": "2023-09-17",
+    "Evacuation of communities in the North & South": "2023-10-15",
+    "First hostage deal": "2023-11-24",
+    "Hanukkah": "2023-12-10",
+    "Shooting of 6 hostages": "2023-12-15",
+    "Building collapse killing 21 soldiers": "2024-01-21",
+    "Rescue operation of 2 hostages": "2024-02-12",
+    "Hostage deal talks": "2024-03-11",
+    "Escalation in the North": "2024-03-23",
+}
 
 
 # -------------------------
-# Tab 0: Overview
+# Tab 0: Overview (CLEAN) ✅ removed boxplot + removed table
 # -------------------------
 with tabs[0]:
     st.subheader("Overview")
 
     if dff["week"].notna().any() and "streams" in dff.columns and dff["streams"].notna().any():
         weekly = dff.groupby(pd.Grouper(key="week", freq="W"))["streams"].sum().reset_index()
+        weekly = weekly.sort_values("week")
+
         fig = px.line(weekly, x="week", y="streams", markers=False)
-        fig.add_vline(x=cutoff_date, line_dash="dash")
-        fig.update_layout(height=420)
+        fig.update_layout(
+            height=420,
+            template="plotly_white",
+            margin=dict(l=40, r=20, t=20, b=40),
+            hovermode="x unified",
+            xaxis_title="Week",
+            yaxis_title="Streams",
+        )
+        y_for_label = float(weekly["streams"].max()) if len(weekly) else None
+        fig = add_event_lines(
+            fig,
+            selected_events if (show_events and selected_events) else [],
+            show_labels=show_event_labels,
+            y_for_label=y_for_label
+        )
+
+
         st.plotly_chart(fig, use_container_width=True)
-
-        if "period" in dff.columns:
-            w2 = dff.groupby(["period", pd.Grouper(key="week", freq="W")])["streams"].sum().reset_index()
-            fig2 = px.box(w2, x="period", y="streams", points="outliers")
-            fig2.update_layout(height=380)
-            st.plotly_chart(fig2, use_container_width=True)
     else:
-        st.warning("Need valid 'week' and 'streams' columns to show overview charts.")
-
-    st.divider()
-    st.write("Sample of filtered data:")
-    st.dataframe(dff.head(30), use_container_width=True)
+        st.warning("Need valid 'week' and 'streams' columns to show overview chart.")
 
 
 # -------------------------
-# Tab 1: Audio features
+# Tab 1: Audio features (NORMALIZED + ROLLING) ✅
 # -------------------------
 with tabs[1]:
-    st.subheader("Audio Features Trends Over Time")
+    st.subheader("Audio Features Trends Over Time (Min-Max Normalized)")
 
-    audio_candidates = [
-        "danceability", "energy", "valence", "tempo", "loudness",
-        "acousticness", "instrumentalness", "speechiness", "liveness"
-    ]
-    audio_cols = [c for c in audio_candidates if c in dff.columns]
+    audio_cols = [c for c in FEATS if c in dff.columns]
 
     if not audio_cols:
         st.warning("No audio feature columns found in CSV.")
-    elif not dff["week"].notna().any():
+        st.stop()
+    if not dff["week"].notna().any():
         st.warning("No valid 'week' column found/parsed.")
-    else:
-        default_features = [c for c in ["energy", "valence", "danceability"] if c in audio_cols]
+        st.stop()
+
+    cA, cB, cC = st.columns([1.6, 1.0, 1.0])
+    with cA:
+        default_features = [c for c in ["energy", "valence", "danceability","acousticness"] if c in audio_cols]
         chosen = st.multiselect("Choose features", audio_cols, default=default_features or audio_cols[:3])
+    with cB:
+        use_rolling = st.checkbox("Rolling smoothing", value=True)
+    with cC:
+        rolling_window = st.slider("Rolling window (weeks)", 1, 8, 3) if use_rolling else 1
 
-        weekly = dff.groupby(pd.Grouper(key="week", freq="W"))[chosen].mean().reset_index()
-        long = weekly.melt(id_vars="week", var_name="feature", value_name="value")
+    tmp = dff[["week"] + chosen].copy()
+    tmp["week"] = pd.to_datetime(tmp["week"], errors="coerce")
+    for c in chosen:
+        tmp[c] = pd.to_numeric(tmp[c], errors="coerce")
+    tmp = tmp.dropna(subset=["week"] + chosen)
 
-        fig = px.line(long, x="week", y="value", color="feature")
-        fig.add_vline(x=cutoff_date, line_dash="dash")
-        fig.update_layout(height=450, legend_title_text="Feature")
-        st.plotly_chart(fig, use_container_width=True)
+    weekly_means = tmp.groupby(pd.Grouper(key="week", freq="W"))[chosen].mean().reset_index()
+    weekly_means = weekly_means.sort_values("week")
+
+    # --- MinMax normalize (0-1) per feature ---
+    weekly_scaled = weekly_means.copy()
+    for f in chosen:
+        x = weekly_means[f].to_numpy(dtype=float)
+        mn = np.nanmin(x)
+        mx = np.nanmax(x)
+        denom = (mx - mn) if (mx - mn) != 0 else 1.0
+        weekly_scaled[f] = (x - mn) / denom
+
+    # --- optional rolling ---
+    weekly_plot = weekly_scaled.copy()
+    if use_rolling:
+        for f in chosen:
+            weekly_plot[f] = weekly_plot[f].rolling(rolling_window, min_periods=1).mean()
+
+    weekly_long = weekly_plot.melt(id_vars="week", value_vars=chosen, var_name="feature", value_name="value")
+
+    # viridis palette (colorblind friendly)
+    viridis = px.colors.sequential.Viridis
+    idx = np.linspace(0, len(viridis) - 1, num=len(chosen)).round().astype(int)
+    color_map = dict(zip(chosen, [viridis[i] for i in idx]))
+
+    fig = px.line(
+        weekly_long,
+        x="week",
+        y="value",
+        color="feature",
+        color_discrete_map=color_map,
+        title=None
+    )
+    fig.update_traces(line=dict(width=3), mode="lines")
+
+    y_max = float(weekly_long["value"].max()) if len(weekly_long) else 1.0
+    fig.add_annotation(
+        x=cutoff_date, y=y_max,
+        text="7.10",
+        showarrow=True,
+        arrowhead=2,
+        ax=20, ay=-30,
+        bgcolor="rgba(255,255,255,0.8)",
+        bordercolor="rgba(0,0,0,0.2)",
+        borderwidth=1
+    )
+
+    fig.update_layout(
+        template="plotly_white",
+        xaxis_title="Week",
+        yaxis_title="Normalized value (0-1)",
+        legend_title_text="Feature",
+        hovermode="x unified",
+        margin=dict(l=50, r=20, t=20, b=50),
+        height=480
+    )
+    fig.update_xaxes(showgrid=True, tickformat="%b %Y", tickangle=-30)
+    fig.update_yaxes(showgrid=True, zeroline=False)
+    y_for_label = float(weekly_long["value"].max()) if len(weekly_long) else None
+    fig = add_event_lines(
+        fig,
+        selected_events if (show_events and selected_events) else [],
+        show_labels=show_event_labels,
+        y_for_label=y_for_label
+    )
+
+
+    st.plotly_chart(fig, use_container_width=True)
+
 
 
 # -------------------------
-# Tab 2: Hebrew vs Non-Hebrew
+# Tab 2: Genres (Before vs After) ✅ (built-in pipeline)
 # -------------------------
 with tabs[2]:
-    st.subheader("Hebrew vs Non-Hebrew Consumption")
+    st.subheader("Weekly Streams per Genre — Before (lighter) vs After (darker) 7.10")
 
-    if "is_hebrew_track" not in dff.columns or dff["is_hebrew_track"].isna().all():
-        st.warning("Hebrew detection column is missing.")
-    elif "streams" not in dff.columns or dff["streams"].isna().all():
-        st.warning("Missing 'streams' column.")
-    elif not dff["week"].notna().any():
+    if not dff["week"].notna().any():
         st.warning("No valid 'week' column.")
-    else:
-        tmp = dff.copy()
-        tmp["track_lang"] = np.where(tmp["is_hebrew_track"] == 1, "Hebrew", "Non-Hebrew")
+        st.stop()
+    if "streams" not in dff.columns or dff["streams"].isna().all():
+        st.warning("Missing 'streams' column.")
+        st.stop()
 
-        weekly = tmp.groupby([pd.Grouper(key="week", freq="W"), "track_lang"])["streams"].sum().reset_index()
-        fig = px.line(weekly, x="week", y="streams", color="track_lang")
-        fig.add_vline(x=cutoff_date, line_dash="dash")
-        fig.update_layout(height=420)
-        st.plotly_chart(fig, use_container_width=True)
+    # ✅ K only here
+    genre_k = st.slider("Number of clusters (K)", 5, 14, 8)
 
-        if "period" in tmp.columns:
-            box = tmp.groupby(["period", "track_lang", pd.Grouper(key="week", freq="W")])["streams"].sum().reset_index()
-            fig2 = px.box(box, x="track_lang", y="streams", color="period", points="outliers")
-            fig2.update_layout(height=420)
-            st.plotly_chart(fig2, use_container_width=True)
+    # run pipeline only for this tab
+    dff_gen, genre_report = add_genres(dff, k=genre_k, random_state=42)
+
+    if not genre_report.get("ok", False):
+        st.warning(f"Genre pipeline not available: {genre_report.get('reason', 'Unknown reason')}")
+        st.stop()
+
+    # ✅ cluster filter only here
+    clusters_available = sorted([int(x) for x in pd.Series(dff_gen["cluster"]).dropna().unique().tolist()])
+    cluster_sel = st.multiselect(
+        "Filter clusters (optional)",
+        options=clusters_available,
+        default=clusters_available
+    )
+    dd = dff_gen[dff_gen["cluster"].isin(cluster_sel)].copy()
+
+    if "genre" not in dd.columns:
+        st.warning("No 'genre' column found (unexpected).")
+        st.stop()
+
+    dd["week"] = pd.to_datetime(dd["week"], errors="coerce")
+    dd = dd.dropna(subset=["week", "genre", "streams"])
+    dd["period"] = np.where(dd["week"] < cutoff_date, "Before 7-Oct", "After 7-Oct")
+
+    weekly = (
+        dd.groupby(["week", "genre", "period"], as_index=False)["streams"].sum()
+          .sort_values("week")
+    )
+
+    weekly["week_label"] = weekly["week"].dt.strftime("%Y-%m-%d")
+    weekly["genre_period"] = weekly["genre"].astype(str) + " | " + weekly["period"].astype(str)
+
+    # Colors (color-blind friendly)
+    base_palette = px.colors.qualitative.Safe
+    genres = sorted(weekly["genre"].unique().tolist())
+    genre_base = {g: base_palette[i % len(base_palette)] for i, g in enumerate(genres)}
+
+    def to_rgba(color, alpha=1.0):
+        if isinstance(color, str) and color.startswith("rgb"):
+            return color.replace("rgb", "rgba").replace(")", f", {alpha})")
+        return color
+
+    color_map = {}
+    for g in genres:
+        c = genre_base[g]
+        color_map[f"{g} | After 7-Oct"] = to_rgba(c, 0.95)
+        color_map[f"{g} | Before 7-Oct"] = to_rgba(c, 0.35)
+
+    genre_order = (
+        weekly.groupby("genre")["streams"].sum()
+              .sort_values(ascending=False).index.tolist()
+    )
+    weekly["genre"] = pd.Categorical(weekly["genre"], categories=genre_order, ordered=True)
+
+    week_order_asc = (
+        weekly[["week", "week_label"]]
+        .drop_duplicates()
+        .sort_values("week", ascending=True)["week_label"]
+        .tolist()
+    )
+
+    fig = px.bar(
+        weekly,
+        x="streams",
+        y="week_label",
+        color="genre_period",
+        color_discrete_map=color_map,
+        facet_row="genre",
+        orientation="h",
+        barmode="overlay",
+        opacity=0.95,
+        title=None,
+        height=170 * max(1, len(genre_order))
+    )
+
+    fig.update_layout(
+        template="plotly_white",
+        legend_title_text="",
+        margin=dict(l=90, r=20, t=20, b=40),
+        bargap=0.02,
+        bargroupgap=0.0,
+    )
+    fig.update_yaxes(categoryorder="array", categoryarray=week_order_asc, autorange="reversed")
+    fig.update_yaxes(title_text="")
+    fig.update_yaxes(matches=None)
+    fig.layout.grid = dict(rows=len(genre_order), columns=1, roworder="top to bottom", ygap=0.02)
+    fig.for_each_annotation(lambda a: a.update(text=a.text.split("=")[-1]))
+    fig.update_xaxes(tickformat="~s")
+
+    st.plotly_chart(fig, use_container_width=True)
+
+    with st.expander("Genre pipeline debug (KMeans report)"):
+        st.write({k: v for k, v in genre_report.items() if k not in ["cluster_sizes", "centroids"]})
+        if "cluster_sizes" in genre_report:
+            st.dataframe(genre_report["cluster_sizes"], use_container_width=True)
+        if "centroids" in genre_report:
+            st.dataframe(genre_report["centroids"], use_container_width=True)
 
 
 # -------------------------
-# Tab 3: Dumbbell + Avatars
+# Tab 3: Dumbbell + Avatars  ❗ DO NOT TOUCH (unchanged)
 # -------------------------
 with tabs[3]:
     st.subheader("Before vs After — Median Monthly Index per Artist (baseline month = 100)")
 
-    # ---- Controls ----
     c1, c2, c3, c4 = st.columns([1.2, 1.2, 1.0, 1.0])
     with c1:
         baseline_month = st.selectbox(
@@ -448,11 +936,10 @@ with tabs[3]:
     with c4:
         show_avatars = st.checkbox("Show avatars", value=True)
 
-    # stance colors
-    RING_GREEN  = "rgba(0,158,115,1)"     # pro
-    RING_ORANGE = "rgba(230,159,0,1)"     # neutral
-    RING_RED    = "rgba(213,94,0,1)"      # anti
-    RING_GRAY   = "rgba(120,120,120,0.9)" # unknown
+    RING_GREEN  = "rgba(0,158,115,1)"
+    RING_ORANGE = "rgba(230,159,0,1)"
+    RING_RED    = "rgba(213,94,0,1)"
+    RING_GRAY   = "rgba(120,120,120,0.9)"
 
     def ring_color(g: str) -> str:
         if g == "pro": return RING_GREEN
@@ -460,14 +947,12 @@ with tabs[3]:
         if g == "neutral": return RING_ORANGE
         return RING_GRAY
 
-    # load meta (keyed by normalized name)
     try:
         meta_full = load_artist_meta_full(META_PATH)
     except Exception as e:
         st.error(f"Failed to load META: {e}")
         st.stop()
 
-    # build folder lookup for images (fallback)
     avatar_lookup = build_avatar_lookup("artists_photos")
 
     def group_of_artist(artist_name: str) -> str:
@@ -483,7 +968,6 @@ with tabs[3]:
         return "data:image/png;base64," + base64.b64encode(png_bytes).decode("utf-8")
 
     def pil_circle_avatar(image_abs: str, size_px: int = 120):
-        """Return circular avatar PNG bytes or None."""
         if not image_abs or not os.path.exists(image_abs):
             return None
         try:
@@ -510,14 +994,12 @@ with tabs[3]:
         except Exception:
             return None
 
-    # Debug: show image existence (top few missing)
     with st.expander("Debug: META + image matching"):
         st.write("META path:", META_PATH)
         st.write("Images folder:", resolve_repo_path("artists_photos"))
-        # count existing via meta_path_abs OR folder lookup
         exists_count = 0
         sample_missing = []
-        for k in meta_full.index[:200]:  # limit
+        for k in meta_full.index[:200]:
             cand = str(meta_full.loc[k, "image_path_abs"])
             ok = cand and Path(cand).exists()
             if not ok:
@@ -536,7 +1018,6 @@ with tabs[3]:
         st.warning("Need valid week/streams/artist_names to build the dumbbell chart.")
         st.stop()
 
-    # Build weekly artist streams (split collabs evenly)
     def split_artists(s):
         if pd.isna(s):
             return []
@@ -548,7 +1029,7 @@ with tabs[3]:
     base_df["n_artists"] = base_df["artist_list"].map(len)
     base_df = base_df.explode("artist_list", ignore_index=True).rename(columns={"artist_list": "artist"})
     base_df["artist"] = base_df["artist"].astype(str).str.strip()
-    base_df["artist"] = base_df["artist"].apply(canon_artist)   # <-- מאחד Ness/Stilla
+    base_df["artist"] = base_df["artist"].apply(canon_artist)
 
     base_df["artist_streams"] = base_df["streams"] / base_df["n_artists"]
 
@@ -570,7 +1051,6 @@ with tabs[3]:
         st.warning("No monthly data after filters.")
         st.stop()
 
-    # Snap baseline month if missing
     if baseline_month not in wide.index:
         nearest = wide.index[np.argmin(np.abs((wide.index - baseline_month).days))]
         st.info(f"Baseline month not found. Using nearest: {nearest.strftime('%Y-%m')}")
@@ -637,7 +1117,6 @@ with tabs[3]:
         customdata=np.stack([summary["artist"], summary["delta"]], axis=1)
     ))
 
-    # Avatars
     missing_files = 0
     failed_open = 0
     if show_avatars:
@@ -651,14 +1130,12 @@ with tabs[3]:
             a = r["artist"]
             k = norm_key(a)
 
-            # priority 1: meta image_path_abs if exists
             img_abs = ""
             if k in meta_full.index:
                 cand = str(meta_full.loc[k, "image_path_abs"])
                 if cand and Path(cand).exists():
                     img_abs = cand
 
-            # priority 2: folder lookup
             if not img_abs:
                 img_abs = avatar_lookup.get(k, "")
 
