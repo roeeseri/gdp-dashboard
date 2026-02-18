@@ -84,7 +84,16 @@ CANONICAL_ARTIST = {
     "stilla": "Ness & Stilla",
     "nessandstilla": "Ness & Stilla",
     "nessstilla": "Ness & Stilla",
+<<<<<<< HEAD
     "theweekend": "The Weeknd",
+=======
+    "tyler" :"Tyler The Creator",
+    "the" : "Tyler The Creator",
+    "creator" : "Tyler The Creator",
+
+    # The Weeknd typo you've got in filenames sometimes
+    "theweekend": "The Weeknd",   # keep if your dataset has this typo
+>>>>>>> e4acb22 (p)
     "theweeknd": "The Weeknd",
 }
 
@@ -546,7 +555,12 @@ def add_genres(df_in: pd.DataFrame, k: int = 8, random_state: int = 42):
 # =========================
 def safe_load():
     main_path = resolve_repo_path("data/merged_all_weeks.csv")
+<<<<<<< HEAD
     meta_path = resolve_repo_path("/workspaces/gdp-dashboard/artist_meta_filled_UPDATED.xlsx")
+=======
+    # make sure your repo contains this file name exactly:
+    meta_path = resolve_repo_path("/workspaces/gdp-dashboard/artist_meta_filled_UPDATED_new.xlsx")
+>>>>>>> e4acb22 (p)
 
     try:
         df_main = load_main_csv(main_path)
@@ -1029,7 +1043,11 @@ with tabs[3]:
     base_df["n_artists"] = base_df["artist_list"].map(len)
     base_df = base_df.explode("artist_list", ignore_index=True).rename(columns={"artist_list": "artist"})
     base_df["artist"] = base_df["artist"].astype(str).str.strip()
+<<<<<<< HEAD
     base_df["artist"] = base_df["artist"].apply(canon_artist)
+=======
+    base_df["artist"] = base_df["artist"].apply(canon_artist)  # <-- מאחד Ness/Stilla
+>>>>>>> e4acb22 (p)
 
     base_df["artist_streams"] = base_df["streams"] / base_df["n_artists"]
 
