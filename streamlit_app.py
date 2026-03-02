@@ -25,11 +25,10 @@ from sklearn.metrics import silhouette_score, calinski_harabasz_score, davies_bo
 # =========================
 st.set_page_config(page_title="Spotify Israel – 7.10 Impact", layout="wide")
 
+BASE_DIR = Path(__file__).resolve().parent
+
 # =========================
-# Spotify-ish palette (Streamlit UI + Plotly)
-# - UI text: spotify green
-# - Plot text inside charts: black
-# - Controls + borders: greys
+# Spotify-ish palette (UI)
 # =========================
 SPOTIFY_GREEN = "#1DB954"
 SPOTIFY_BLACK = "#191414"
@@ -37,33 +36,51 @@ SPOTIFY_GRAY  = "#B3B3B3"
 SPOTIFY_GRAY2 = "#E6E6E6"
 SPOTIFY_GRAY3 = "#6B6B6B"
 
-# Streamlit UI styling (white background, green headings, GREY widgets accents)
+# =========================
+# Colorblind-friendly palette (high contrast) for genres
+# (Okabe-Ito / Tol-like)
+# =========================
+CB_PALETTE = [
+    "#0072B2",  # blue
+    "#E69F00",  # orange
+    "#009E73",  # green
+    "#D55E00",  # vermillion
+    "#CC79A7",  # purple
+    "#56B4E9",  # sky blue
+    "#F0E442",  # yellow
+    "#000000",  # black
+    "#999999",  # grey
+    "#332288",  # indigo
+    "#88CCEE",  # light blue
+    "#117733",  # dark green
+    "#DDCC77",  # sand
+    "#AA4499",  # magenta
+]
+
+# =========================
+# Streamlit UI styling
+# =========================
 st.markdown(
     f"""
     <style>
-    /* App background */
     .stApp {{
         background: #FFFFFF;
         color: {SPOTIFY_GREEN};
     }}
 
-    /* Sidebar background */
     section[data-testid="stSidebar"] {{
         background: #FFFFFF;
         border-right: 1px solid rgba(0,0,0,0.08);
     }}
 
-    /* Titles/headers in Streamlit: green */
     h1, h2, h3, h4, h5, h6 {{
         color: {SPOTIFY_GREEN} !important;
     }}
 
-    /* Regular text in Streamlit: spotify black */
     p, span, div, label, .stCaption, .stMarkdown, .stText, .stMetricLabel {{
         color: {SPOTIFY_BLACK} !important;
     }}
 
-    /* Metric cards */
     div[data-testid="stMetric"] {{
         background: #FFFFFF;
         border: 1px solid rgba(0,0,0,0.10);
@@ -71,7 +88,6 @@ st.markdown(
         border-radius: 14px;
     }}
 
-    /* Plot containers */
     div[data-testid="stPlotlyChart"] {{
         background: #FFFFFF;
         border: 1px solid rgba(0,0,0,0.10);
@@ -79,7 +95,6 @@ st.markdown(
         padding: 10px 10px;
     }}
 
-    /* Make slider/selection accents grey-ish (Streamlit varies by version; best-effort) */
     div[data-baseweb="slider"] * {{
         color: {SPOTIFY_BLACK} !important;
     }}
@@ -105,9 +120,6 @@ EVENTS = {
     "Hostage deal talks": "2024-03-11",
     "Escalation in the North": "2024-03-23",
 }
-
-BASE_DIR = Path(__file__).resolve().parent
-
 
 # =========================
 # Path utils
@@ -227,7 +239,6 @@ def add_event_lines(fig, selected_event_labels, *, show_labels=False, y_for_labe
 
 
 def apply_spotify_plotly_layout(fig: go.Figure):
-    # ✅ chart text black, not green
     fig.update_layout(
         paper_bgcolor="#FFFFFF",
         plot_bgcolor="#FFFFFF",
@@ -254,9 +265,6 @@ def apply_spotify_plotly_layout(fig: go.Figure):
 # Plotly hover-zoom for layout_image (Tab 3)
 # =========================
 def render_plotly_with_hover_image_zoom(fig: go.Figure, height: int, zoom: float = 2.35):
-    """
-    Bigger hover zoom (default 2.35)
-    """
     div_id = "plotly-dumbbell-hoverzoom"
     fig_html = pio.to_html(
         fig,
@@ -664,7 +672,8 @@ def add_genres(df_in: pd.DataFrame, k: int = 8, random_state: int = 42):
 # =========================
 def safe_load():
     main_path = resolve_repo_path("data/merged_all_weeks.csv")
-    meta_path = resolve_repo_path("/workspaces/gdp-dashboard/artist_meta.xlsx")
+    # NOTE: set your meta path here
+    meta_path = resolve_repo_path("artist_meta.xlsx")  # <-- put the file in repo root OR change this
 
     try:
         df_main = load_main_csv(main_path)
@@ -722,12 +731,11 @@ if "artist_group" in dff.columns:
     group_sel = st.sidebar.multiselect("Artist Group", options=groups, default=groups)
     dff = dff[dff["artist_group"].fillna("Unknown").isin(group_sel)]
 
-
 # =========================
 # Header & KPIs
 # =========================
 st.title("Spotify Israel – Listening Patterns Around 7.10")
-st.caption("Dashboard built from merged_all_weeks.csv + artist_meta_filled_UPDATED.xlsx")
+st.caption("Dashboard built from merged_all_weeks.csv + artist_meta.xlsx")
 
 k1, k2, k3, k4 = st.columns(4)
 k1.metric("Total Streams", f"{int(dff['streams'].sum()):,}" if "streams" in dff.columns and dff["streams"].notna().any() else "N/A")
@@ -752,7 +760,6 @@ selected_events = st.sidebar.multiselect(
 )
 show_event_labels = st.sidebar.checkbox("Show event labels on chart", value=False)
 
-
 # =========================
 # Tabs
 # =========================
@@ -760,7 +767,7 @@ tabs = st.tabs([
     "Overview",
     "Audio Features Over Time",
     "Genres (Before vs After)",
-    "Before vs After (Dumbbell + Avatars)",
+    "Before vs After (Artists Index)",
 ])
 
 cutoff_date = pd.Timestamp("2023-10-07")
@@ -800,7 +807,7 @@ with tabs[0]:
 
 
 # -------------------------
-# Tab 1: Audio features (keep clean + spotify-ish lines)
+# Tab 1: Audio features
 # -------------------------
 with tabs[1]:
     st.subheader("Audio Features Trends Over Time (Min-Max Normalized)")
@@ -846,10 +853,9 @@ with tabs[1]:
 
     weekly_long = weekly_plot.melt(id_vars="week", value_vars=chosen, var_name="feature", value_name="value")
 
-    # Use a spotify-ish, muted color mapping:
-    # First series green, then greys. (Stable mapping by order)
-    series_colors = [SPOTIFY_GREEN, "#4A4A4A", "#7A7A7A", "#A0A0A0", "#C0C0C0", "#2B2B2B", "#8A8A8A", "#B8B8B8"]
-    color_map = {f: series_colors[i % len(series_colors)] for i, f in enumerate(chosen)}
+    # ✅ Colorblind-friendly distinct colors per feature (stable order by FEATS list)
+    feature_order = [f for f in FEATS if f in chosen]  # keep canonical order
+    color_map = {f: CB_PALETTE[i % len(CB_PALETTE)] for i, f in enumerate(feature_order)}
 
     fig = px.line(
         weekly_long,
@@ -899,7 +905,10 @@ with tabs[1]:
 
 
 # -------------------------
-# Tab 2: Genres (bar facets) - switch to spotify-ish grey palette
+# Tab 2: Genres (colorblind-friendly distinct per genre)
+# -------------------------
+# -------------------------
+# Tab 2: Genres (Before vs After) — CLEAN (no "holes") + choose #genres
 # -------------------------
 with tabs[2]:
     st.subheader("Weekly Streams per Genre — Before (lighter) vs After (darker) 7.10")
@@ -911,6 +920,7 @@ with tabs[2]:
         st.warning("Missing 'streams' column.")
         st.stop()
 
+    # KMeans
     genre_k = st.slider("Number of clusters (K)", 5, 14, 8)
 
     dff_gen, genre_report = add_genres(dff, k=genre_k, random_state=42)
@@ -918,6 +928,7 @@ with tabs[2]:
         st.warning(f"Genre pipeline not available: {genre_report.get('reason', 'Unknown reason')}")
         st.stop()
 
+    # Cluster filter
     clusters_available = sorted([int(x) for x in pd.Series(dff_gen["cluster"]).dropna().unique().tolist()])
     cluster_sel = st.multiselect(
         "Filter clusters (optional)",
@@ -936,51 +947,40 @@ with tabs[2]:
 
     weekly = (
         dd.groupby(["week", "genre", "period"], as_index=False)["streams"].sum()
-        .sort_values("week")
+          .sort_values("week")
     )
 
+    # ---- Choose how many genres to show (Top N by total streams)
+    genre_order = (
+        weekly.groupby("genre")["streams"].sum()
+              .sort_values(ascending=False).index.tolist()
+    )
+    max_g = max(1, len(genre_order))
+    top_genres_n = st.slider("How many genres to show (Top N)", 1, max_g, min(10, max_g))
+    genre_order = genre_order[:top_genres_n]
+
+    weekly = weekly[weekly["genre"].isin(genre_order)].copy()
+    weekly["genre"] = pd.Categorical(weekly["genre"], categories=genre_order, ordered=True)
+
+    # Labels for plot
     weekly["week_label"] = weekly["week"].dt.strftime("%Y-%m-%d")
     weekly["genre_period"] = weekly["genre"].astype(str) + " | " + weekly["period"].astype(str)
 
-    # Spotify-ish greys per genre with one accent green
-    genres = sorted(weekly["genre"].unique().tolist())
-
-    # build deterministic greys, then assign green to the top (by total streams) genre
-    genre_order = (
-        weekly.groupby("genre")["streams"].sum()
-        .sort_values(ascending=False).index.tolist()
-    )
-    top_genre = genre_order[0] if genre_order else (genres[0] if genres else None)
-
-    greys = ["#2B2B2B", "#4A4A4A", "#6B6B6B", "#8A8A8A", "#A0A0A0", "#B3B3B3", "#C8C8C8"]
-    base_color = {}
-    for i, g in enumerate(genre_order):
-        base_color[g] = greys[i % len(greys)]
-    if top_genre is not None:
-        base_color[top_genre] = SPOTIFY_GREEN
-
-    def to_rgba_hex(hex_color: str, alpha: float):
+    # ---- Colors: one distinct per genre (CB_PALETTE), Before/After differs by alpha
+    def to_rgba(hex_color: str, alpha: float) -> str:
         hc = hex_color.lstrip("#")
-        r = int(hc[0:2], 16)
-        g = int(hc[2:4], 16)
-        b = int(hc[4:6], 16)
+        r = int(hc[0:2], 16); g = int(hc[2:4], 16); b = int(hc[4:6], 16)
         return f"rgba({r},{g},{b},{alpha})"
+
+    genre_color = {g: CB_PALETTE[i % len(CB_PALETTE)] for i, g in enumerate(genre_order)}
 
     color_map = {}
     for g in genre_order:
-        c = base_color[g]
-        color_map[f"{g} | After 7-Oct"] = to_rgba_hex(c, 0.90)
-        color_map[f"{g} | Before 7-Oct"] = to_rgba_hex(c, 0.30)
+        c = genre_color[g]
+        color_map[f"{g} | After 7-Oct"]  = to_rgba(c, 0.92)
+        color_map[f"{g} | Before 7-Oct"] = to_rgba(c, 0.30)
 
-    weekly["genre"] = pd.Categorical(weekly["genre"], categories=genre_order, ordered=True)
-
-    week_order_asc = (
-        weekly[["week", "week_label"]]
-        .drop_duplicates()
-        .sort_values("week", ascending=True)["week_label"]
-        .tolist()
-    )
-
+    # ---- PLOT (IMPORTANT: do NOT force a global categoryarray => removes "holes")
     fig = px.bar(
         weekly,
         x="streams",
@@ -1002,9 +1002,12 @@ with tabs[2]:
         bargap=0.02,
         bargroupgap=0.0,
     )
-    fig.update_yaxes(categoryorder="array", categoryarray=week_order_asc, autorange="reversed")
+
+    # each facet controls its own Y -> no holes
+    fig.update_yaxes(autorange="reversed")
     fig.update_yaxes(title_text="")
     fig.update_yaxes(matches=None)
+
     fig.layout.grid = dict(rows=len(genre_order), columns=1, roworder="top to bottom", ygap=0.02)
     fig.for_each_annotation(lambda a: a.update(text=a.text.split("=")[-1]))
     fig.update_xaxes(tickformat="~s")
@@ -1019,45 +1022,42 @@ with tabs[2]:
         if "centroids" in genre_report:
             st.dataframe(genre_report["centroids"], use_container_width=True)
 
-
 # -------------------------
-# Tab 3: Dumbbell + Avatars (HOVER = GROW CIRCLE A LOT)
+# Tab 3: Dumbbell + Avatars (fixed split, clear pro/anti/neutral colors)
 # -------------------------
 with tabs[3]:
-    st.subheader("Before vs After — Median Monthly Index per Artist (baseline month = 100)")
+    # Fixed baseline (course requirement)
+    baseline_month = pd.Timestamp("2023-10-01")
+    st.subheader("Before vs After — Median Monthly Index per Artist")
+    st.caption(
+    "Monthly streams indexed to October 2023 (=100). "
+    "Comparison reflects listening behavior before and after October 7.")
 
-    c1, c2, c3, c4 = st.columns([1.2, 1.2, 1.0, 1.0])
-    with c1:
-        baseline_month = st.selectbox(
-            "Baseline month (index = 100)",
-            options=pd.date_range("2023-01-01", "2024-12-01", freq="MS"),
-            index=list(pd.date_range("2023-01-01", "2024-12-01", freq="MS")).index(pd.Timestamp("2023-10-01"))
-        )
-    with c2:
-        split_month = st.selectbox(
-            "Before/After split month",
-            options=pd.date_range("2023-01-01", "2024-12-01", freq="MS"),
-            index=list(pd.date_range("2023-01-01", "2024-12-01", freq="MS")).index(pd.Timestamp("2023-10-01"))
-        )
+    # UI: baseline + top_k + avatars (NO split selector)
+    c3, c4 = st.columns([1.0, 1.0])
     with c3:
         top_k = st.slider("Top K artists", 5, 40, 23)
     with c4:
         show_avatars = st.checkbox("Show avatars", value=True)
 
-    # keep your ring palette as-is (it encodes meaning), but make it less saturated
-    RING_GREEN = "rgba(29,185,84,1)"     # spotify green
-    RING_ORANGE = "rgba(180,180,180,1)"  # grey
-    RING_RED = "rgba(90,90,90,1)"        # dark grey
-    RING_GRAY = "rgba(140,140,140,0.9)"  # mid grey
+    # Fixed split (no UI)
+    split_month = pd.Timestamp("2023-10-01")
+
+    # Group colors: clear & meaningful
+    RING_PRO     = "rgba(29,185,84,1)"     # Pro-Israel (green)
+    RING_ANTI    = "rgba(214, 39, 40,1)"   # Anti-Israel (red)
+    RING_NEUTRAL = "rgba(31,119,180,1)"    # Neutral (blue)
+    RING_UNKNOWN = "rgba(160,160,160,1)"   # Unknown (grey)
 
     def ring_color(g: str) -> str:
-        if g == "pro": return RING_GREEN
-        if g == "anti": return RING_RED
-        if g == "neutral": return RING_ORANGE
-        return RING_GRAY
+        if g == "pro": return RING_PRO
+        if g == "anti": return RING_ANTI
+        if g == "neutral": return RING_NEUTRAL
+        return RING_UNKNOWN
 
     try:
         meta_full = load_artist_meta_full(META_PATH)
+
     except Exception as e:
         st.error(f"Failed to load META: {e}")
         st.stop()
@@ -1104,7 +1104,7 @@ with tabs[3]:
             return None
 
     if "artist_names" not in dff.columns or "streams" not in dff.columns or not dff["week"].notna().any():
-        st.warning("Need valid week/streams/artist_names to build the dumbbell chart.")
+        st.warning("Need valid week/streams/artist_names to build the chart.")
         st.stop()
 
     def split_artists(s):
@@ -1119,8 +1119,8 @@ with tabs[3]:
     base_df = base_df.explode("artist_list", ignore_index=True).rename(columns={"artist_list": "artist"})
     base_df["artist"] = base_df["artist"].astype(str).str.strip()
     base_df["artist"] = base_df["artist"].apply(canon_artist)
-    base_df["artist"] = base_df["artist"].apply(canon_artist)
 
+    # Split streams among collaborators
     base_df["artist_streams"] = base_df["streams"] / base_df["n_artists"]
 
     weekly = (
@@ -1131,6 +1131,7 @@ with tabs[3]:
 
     weekly["month"] = weekly["week"].dt.to_period("M").dt.to_timestamp()
     monthly = weekly.groupby(["month", "artist"], as_index=False)["streams"].sum()
+
     wide = (
         monthly.pivot_table(index="month", columns="artist", values="streams", aggfunc="sum")
         .sort_index()
@@ -1141,6 +1142,7 @@ with tabs[3]:
         st.warning("No monthly data after filters.")
         st.stop()
 
+    # snap baseline to nearest available month if missing
     if baseline_month not in wide.index:
         nearest = wide.index[np.argmin(np.abs((wide.index - baseline_month).days))]
         st.info(f"Baseline month not found. Using nearest: {nearest.strftime('%Y-%m')}")
@@ -1171,12 +1173,14 @@ with tabs[3]:
     summary["delta"] = summary["After"] - summary["Before"]
     summary["importance"] = summary["Before"] + summary["After"]
 
+    # top_k by importance then sort by delta for nice visual
     summary = summary.sort_values("importance", ascending=False).head(top_k).copy()
     summary = summary.sort_values("delta", ascending=True).reset_index(drop=True)
     summary["y"] = np.arange(len(summary))
 
     fig = go.Figure()
 
+    # connector lines
     for _, r in summary.iterrows():
         fig.add_trace(go.Scatter(
             x=[r["Before"], r["After"]],
@@ -1187,6 +1191,7 @@ with tabs[3]:
             hoverinfo="skip"
         ))
 
+    # Before points
     fig.add_trace(go.Scatter(
         x=summary["Before"],
         y=summary["y"],
@@ -1197,6 +1202,7 @@ with tabs[3]:
         customdata=summary["artist"]
     ))
 
+    # After points
     fig.add_trace(go.Scatter(
         x=summary["After"],
         y=summary["y"],
@@ -1207,19 +1213,16 @@ with tabs[3]:
         customdata=np.stack([summary["artist"], summary["delta"]], axis=1)
     ))
 
+    # avatars
     missing_files = 0
     failed_open = 0
-
-    hover_x = []
-    hover_y = []
-    hover_img_idx = []
+    hover_x, hover_y, hover_img_idx = [], [], []
 
     if show_avatars:
         x_min = float(np.nanmin(summary[["Before", "After"]].values))
         x_max = float(np.nanmax(summary[["Before", "After"]].values))
         x_range = max(1.0, x_max - x_min)
 
-        # base thumbnails
         x_sizex = max(5.6, 0.105 * x_range)
         x_offset = 0.03 * x_range
         sizey = 1.15
@@ -1267,14 +1270,14 @@ with tabs[3]:
             hover_y.append(hy)
             hover_img_idx.append(img_idx)
 
-    # ✅ make the invisible hover "hit area" MUCH bigger
+    # invisible big hover hit-area
     if hover_x:
         fig.add_trace(go.Scatter(
             x=hover_x,
             y=hover_y,
             mode="markers",
             showlegend=False,
-            marker=dict(size=70, color="rgba(0,0,0,0)"),  # << BIGGER hover area
+            marker=dict(size=70, color="rgba(0,0,0,0)"),
             customdata=np.array(hover_img_idx, dtype=int),
             hovertemplate="<extra></extra>"
         ))
@@ -1285,38 +1288,40 @@ with tabs[3]:
         ticktext=summary["artist"],
         title="Artist"
     )
+
     fig.update_xaxes(
         title=f"Monthly streams index (baseline: {pd.Timestamp(baseline_month).strftime('%b %Y')} = 100)",
         zeroline=False
     )
 
+    # legend entries
     fig.add_trace(go.Scatter(
         x=[None], y=[None], mode="lines+markers",
-        line=dict(width=4, color=RING_GREEN),
-        marker=dict(size=12, color="white", line=dict(width=4, color=RING_GREEN)),
+        line=dict(width=4, color=RING_PRO),
+        marker=dict(size=12, color="white", line=dict(width=4, color=RING_PRO)),
         name="Pro-Israel / Israeli"
     ))
     fig.add_trace(go.Scatter(
         x=[None], y=[None], mode="lines+markers",
-        line=dict(width=4, color=RING_ORANGE),
-        marker=dict(size=12, color="white", line=dict(width=4, color=RING_ORANGE)),
+        line=dict(width=4, color=RING_NEUTRAL),
+        marker=dict(size=12, color="white", line=dict(width=4, color=RING_NEUTRAL)),
         name="Neutral / not stated"
     ))
     fig.add_trace(go.Scatter(
         x=[None], y=[None], mode="lines+markers",
-        line=dict(width=4, color=RING_RED),
-        marker=dict(size=12, color="white", line=dict(width=4, color=RING_RED)),
+        line=dict(width=4, color=RING_ANTI),
+        marker=dict(size=12, color="white", line=dict(width=4, color=RING_ANTI)),
         name="Anti-Israel"
     ))
     fig.add_trace(go.Scatter(
         x=[None], y=[None], mode="lines+markers",
-        line=dict(width=4, color=RING_GRAY),
-        marker=dict(size=12, color="white", line=dict(width=4, color=RING_GRAY)),
+        line=dict(width=4, color=RING_UNKNOWN),
+        marker=dict(size=12, color="white", line=dict(width=4, color=RING_UNKNOWN)),
         name="Unknown"
     ))
 
     fig.update_layout(
-        title="Median monthly streams — Before vs After (indexed baseline = 100)",
+        title="Median Monthly Streams Index by Artist (Before vs After 7.10)",
         template="plotly_white",
         height=max(650, 34 * len(summary)),
         margin=dict(l=260, r=260, t=80, b=60),
@@ -1332,7 +1337,7 @@ with tabs[3]:
     fig = apply_spotify_plotly_layout(fig)
 
     chart_h = max(650, 34 * len(summary))
-    render_plotly_with_hover_image_zoom(fig, height=chart_h, zoom=3.10)  # << MUCH bigger image on hover
+    render_plotly_with_hover_image_zoom(fig, height=chart_h, zoom=3.10)
 
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Artists shown", f"{len(summary)}")
