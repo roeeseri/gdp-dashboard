@@ -1,8 +1,14 @@
-# :earth_americas: GDP dashboard template
+# Spotify Israel – Listening Patterns Around 7.10 (Streamlit Dashboard)
 
-A simple Streamlit app showing the GDP of different countries in the world.
+A Streamlit dashboard analyzing Israeli Spotify listening patterns **before and after Oct 7, 2023**.
+The app is built from:
+- `data/merged_all_weeks.csv` (weekly chart data + audio features)
+- `artist_meta.xlsx` (artist groups + optional image paths)
+- optional `artists_photos/` folder (artist avatars)
 
-[![Open in Streamlit](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://gdp-dashboard-template.streamlit.app/)
+---
+
+[![Open in Streamlit](https://gdp-dashboard-mo6fq9uiz09.streamlit.app)
 
 ### How to run it on your own machine
 
