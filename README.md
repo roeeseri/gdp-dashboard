@@ -8,7 +8,7 @@ The app is built from:
 
 ---
 
-[![Open in Streamlit](https://gdp-dashboard-mo6fq9uiz09.streamlit.app)
+[![Open in Streamlit](https://gdp-dashboard-mo6fq9uiz09.streamlit.app/)
 
 ### How to run it on your own machine
 
