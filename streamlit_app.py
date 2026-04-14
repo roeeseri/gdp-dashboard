@@ -1151,7 +1151,7 @@ with tabs[3]:
     baseline = wide.loc[baseline_month].replace(0, np.nan)
     indexed = (wide.divide(baseline, axis=1) * 100.0).replace([np.inf, -np.inf], np.nan)
 
-    idx_long = indexed.stack(dropna=False).reset_index()
+    idx_long = indexed.stack().reset_index()
     idx_long.columns = ["month", "artist", "index_value"]
     idx_long = idx_long.dropna(subset=["index_value"]).copy()
     idx_long["period2"] = np.where(idx_long["month"] < split_month, "Before", "After")
